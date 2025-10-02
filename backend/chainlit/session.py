@@ -203,7 +203,7 @@ class McpSession:
     def __init__(
         self,
         name: str,
-        session: ClientSession,
+        session: "ClientSession",
         task: asyncio.Task,
         stop_event: asyncio.Event,
     ):
