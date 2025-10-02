@@ -331,16 +331,20 @@ async def window_message(sid, data):
 
 
 @sio.on("audio_start")  # pyright: ignore [reportOptionalCall]
-async def audio_start(sid):
+async def audio_start(sid: str):
     """Handle audio init."""
     session = WebsocketSession.require(sid)
 
     context = init_ws_context(session)
     config: ChainlitConfig = session.get_config()
 
-    if config.features.audio and config.features.audio.enabled:
+    if (
+        config.features.audio
+        and config.features.audio.enabled
+        and config.code.on_audio_start
+    ):
         connected = bool(await config.code.on_audio_start())
-        connection_state = "on" if connected else "off"
+        connection_state: Literal["on", "off"] = "on" if connected else "off"
         await context.emitter.update_audio_connection(connection_state)
 
 
@@ -362,7 +366,7 @@ async def audio_chunk(sid, payload: InputAudioChunkPayload):
 
 
 @sio.on("audio_end")
-async def audio_end(sid):
+async def audio_end(sid: str):
     """Handle the end of the audio stream."""
     session = WebsocketSession.require(sid)
 
@@ -376,7 +380,11 @@ async def audio_end(sid):
 
         config: ChainlitConfig = session.get_config()
 
-        if config.features.audio and config.features.audio.enabled:
+        if (
+            config.features.audio
+            and config.features.audio.enabled
+            and config.code.on_audio_end
+        ):
             await config.code.on_audio_end()
 
     except asyncio.CancelledError:
