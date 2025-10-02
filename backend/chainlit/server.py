@@ -1275,7 +1275,7 @@ async def _setup_mcp_session(
     ready_event = asyncio.Event()
 
     async def _call() -> None:
-        from mcp import ClientSession
+        from mcp.client.session import ClientSession
         from mcp.client.sse import sse_client
         from mcp.client.stdio import (
             StdioServerParameters,
