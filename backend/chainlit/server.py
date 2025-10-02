@@ -58,8 +58,15 @@ from chainlit.data import get_data_layer
 from chainlit.data.acl import is_thread_author
 from chainlit.logger import logger
 from chainlit.markdown import get_markdown_str
+from chainlit.mcp import (
+    HttpMcpConnection,
+    McpConnection,
+    SseMcpConnection,
+    StdioMcpConnection,
+)
 from chainlit.oauth_providers import get_oauth_provider
 from chainlit.secret import random_secret
+from chainlit.session import McpSession, WebsocketSession
 from chainlit.types import (
     AskFileSpec,
     CallActionRequest,
@@ -1262,19 +1269,129 @@ async def call_action(
     return JSONResponse(content={"success": True, "response": response})
 
 
+async def _setup_mcp_session(
+    mcp_connection: McpConnection, session: WebsocketSession
+) -> None:
+    ready_event = asyncio.Event()
+
+    async def _call() -> None:
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+        from mcp.client.stdio import (
+            StdioServerParameters,
+            stdio_client,
+        )
+        from mcp.client.streamable_http import streamablehttp_client
+
+        if mcp_connection.name in session.mcp_sessions:
+            old_session = session.mcp_sessions[mcp_connection.name]
+            if on_mcp_disconnect := config.code.on_mcp_disconnect:
+                await on_mcp_disconnect(old_session.name, old_session.session)
+            try:
+                await old_session.close()
+            except Exception:
+                logger.exception(
+                    f"Failed to disconnect old MCP session of {mcp_connection.name}"
+                )
+                raise
+
+        client_type = mcp_connection.clientType
+        if client_type == "sse":
+            sse_connection = cast(SseMcpConnection, mcp_connection)
+            client_cm = sse_client(
+                url=sse_connection.url,
+                headers=sse_connection.headers,
+            )
+        elif client_type == "stdio":
+            # Create the server parameters
+            stdio_connection = cast(StdioMcpConnection, mcp_connection)
+            server_params = StdioServerParameters(
+                command=stdio_connection.command,
+                args=stdio_connection.args,
+                env=stdio_connection.env,
+            )
+            client_cm = stdio_client(server_params)
+        elif client_type == "streamable-http":
+            http_connection = cast(HttpMcpConnection, mcp_connection)
+            client_cm = streamablehttp_client(
+                url=http_connection.url,
+                headers=http_connection.headers,
+            )
+        else:
+            raise ValueError(f"Unexpected client type: {client_type}")
+
+        exit_stack = AsyncExitStack()
+        try:
+            transport = await exit_stack.enter_async_context(client_cm)
+            # The transport can return (read, write) for stdio, sse
+            # Or (read, write, get_session_id) for streamable-http
+            # We are only interested in the read and write streams here.
+            read, write = transport[:2]
+
+            mcp_session: ClientSession = await exit_stack.enter_async_context(
+                ClientSession(
+                    read_stream=read, write_stream=write, sampling_callback=None
+                )
+            )
+
+            # Initialize the session
+            await mcp_session.initialize()
+        except Exception:
+            logger.exception(
+                f"Failed to initialize the MCP session for {mcp_connection.name}"
+            )
+            raise
+
+        # Call the callback
+        if config.code.on_mcp_connect:
+            try:
+                await config.code.on_mcp_connect(mcp_connection, mcp_session)
+            except Exception:
+                logger.exception(
+                    f"Failed to execute on_mcp_connect hook for {mcp_connection.name}"
+                )
+                raise
+
+        stop_event = asyncio.Event()
+        current_task = asyncio.current_task()
+        assert current_task, (
+            "current_task should not be None inside async method '_call'"
+        )  # fix type check
+        # Store the session
+        session.mcp_sessions[mcp_connection.name] = McpSession(
+            name=mcp_connection.name,
+            session=mcp_session,
+            task=current_task,
+            stop_event=stop_event,
+        )
+
+        # mark as ready
+        logger.info(f"MCP session for {mcp_connection.name} is ready")
+        ready_event.set()
+
+        # Wait for the stop event
+        await stop_event.wait()
+        logger.info(f"Closing MCP session {mcp_connection.name}")
+        try:
+            await exit_stack.aclose()
+        except Exception:
+            logger.exception("Error during exit stack close")
+            raise
+        logger.info(f"MCP session {mcp_connection.name} closed")
+
+    # Run the session runner in a separate task
+    asyncio.create_task(_call())
+    logger.info(f"Waiting for MCP connection {mcp_connection.name} to be ready")
+    await ready_event.wait()
+    logger.info(f"MCP connection {mcp_connection.name} is ready")
+
+
 @router.post("/mcp")
 async def connect_mcp(
     payload: ConnectMCPRequest,
     current_user: UserParam,
 ):
-    from mcp import ClientSession
-    from mcp.client.sse import sse_client
-    from mcp.client.stdio import (
-        StdioServerParameters,
-        get_default_environment,
-        stdio_client,
-    )
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.stdio import get_default_environment
 
     from chainlit.context import init_ws_context
     from chainlit.mcp import (
@@ -1301,17 +1418,7 @@ async def connect_mcp(
 
     mcp_enabled = config.features.mcp.enabled
     if mcp_enabled:
-        if payload.name in session.mcp_sessions:
-            old_client_session, old_exit_stack = session.mcp_sessions[payload.name]
-            if on_mcp_disconnect := config.code.on_mcp_disconnect:
-                await on_mcp_disconnect(payload.name, old_client_session)
-            try:
-                await old_exit_stack.aclose()
-            except Exception:
-                pass
-
         try:
-            exit_stack = AsyncExitStack()
             mcp_connection: McpConnection
 
             if payload.clientType == "sse":
@@ -1326,13 +1433,6 @@ async def connect_mcp(
                     name=payload.name,
                     headers=getattr(payload, "headers", None),
                 )
-
-                transport = await exit_stack.enter_async_context(
-                    sse_client(
-                        url=mcp_connection.url,
-                        headers=mcp_connection.headers,
-                    )
-                )
             elif payload.clientType == "stdio":
                 if not config.features.mcp.stdio.enabled:
                     raise HTTPException(
@@ -1341,21 +1441,11 @@ async def connect_mcp(
                     )
 
                 env_from_cmd, command, args = validate_mcp_command(payload.fullCommand)
-                mcp_connection = StdioMcpConnection(
-                    command=command, args=args, name=payload.name
-                )
-
                 env = get_default_environment()
                 env.update(env_from_cmd)
-                # Create the server parameters
-                server_params = StdioServerParameters(
-                    command=command, args=args, env=env
+                mcp_connection = StdioMcpConnection(
+                    command=command, args=args, env=env, name=payload.name
                 )
-
-                transport = await exit_stack.enter_async_context(
-                    stdio_client(server_params)
-                )
-
             elif payload.clientType == "streamable-http":
                 if not config.features.mcp.streamable_http.enabled:
                     raise HTTPException(
@@ -1367,33 +1457,8 @@ async def connect_mcp(
                     name=payload.name,
                     headers=getattr(payload, "headers", None),
                 )
-                transport = await exit_stack.enter_async_context(
-                    streamablehttp_client(
-                        url=mcp_connection.url,
-                        headers=mcp_connection.headers,
-                    )
-                )
 
-            # The transport can return (read, write) for stdio, sse
-            # Or (read, write, get_session_id) for streamable-http
-            # We are only interested in the read and write streams here.
-            read, write = transport[:2]
-
-            mcp_session: ClientSession = await exit_stack.enter_async_context(
-                ClientSession(
-                    read_stream=read, write_stream=write, sampling_callback=None
-                )
-            )
-
-            # Initialize the session
-            await mcp_session.initialize()
-
-            # Store the session
-            session.mcp_sessions[mcp_connection.name] = (mcp_session, exit_stack)
-
-            # Call the callback
-            if config.code.on_mcp_connect:
-                await config.code.on_mcp_connect(mcp_connection, mcp_session)
+            await _setup_mcp_session(mcp_connection, session)
 
         except Exception as e:
             raise HTTPException(
@@ -1406,7 +1471,7 @@ async def connect_mcp(
             detail="This app does not support MCP.",
         )
 
-    tool_list = await mcp_session.list_tools()
+    tool_list = await session.mcp_sessions[payload.name].session.list_tools()
 
     return JSONResponse(
         content={
@@ -1453,14 +1518,17 @@ async def disconnect_mcp(
     callback = config.code.on_mcp_disconnect
     if payload.name in session.mcp_sessions:
         try:
-            client_session, exit_stack = session.mcp_sessions[payload.name]
+            old_session = session.mcp_sessions[payload.name]
             if callback:
-                await callback(payload.name, client_session)
+                await callback(payload.name, old_session.session)
 
             try:
-                await exit_stack.aclose()
+                await old_session.close()
             except Exception:
-                pass
+                logger.exception(
+                    f"Failed to disconnect old MCP session of {payload.name}"
+                )
+                raise
             del session.mcp_sessions[payload.name]
 
         except Exception as e:

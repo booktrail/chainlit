@@ -4,7 +4,6 @@ import mimetypes
 import re
 import shutil
 import uuid
-from contextlib import AsyncExitStack
 from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, Literal, Optional, Union
 
 import aiofiles
@@ -200,6 +199,27 @@ class HTTPSession(BaseSession):
 ThreadQueue = Deque[tuple[Callable, object, tuple, Dict]]
 
 
+class McpSession:
+    def __init__(
+        self,
+        name: str,
+        session: ClientSession,
+        task: asyncio.Task,
+        stop_event: asyncio.Event,
+    ):
+        self.name = name
+        self.session = session
+        self.task = task
+        self.stop_event = stop_event
+
+    async def close(self) -> None:
+        logger.info(f"Sending stop event to {self.name}")
+        self.stop_event.set()
+        logger.info(f"Waiting for task {self.name} to finish")
+        await self.task
+        logger.info(f"Task {self.name} finished")
+
+
 class WebsocketSession(BaseSession):
     """Internal web socket session object.
 
@@ -214,7 +234,7 @@ class WebsocketSession(BaseSession):
 
     to_clear: bool = False
 
-    mcp_sessions: dict[str, tuple["ClientSession", AsyncExitStack]]
+    mcp_sessions: dict[str, McpSession]
 
     def __init__(
         self,
@@ -321,11 +341,14 @@ class WebsocketSession(BaseSession):
         ws_sessions_sid.pop(self.socket_id, None)
         ws_sessions_id.pop(self.id, None)
 
-        for _, exit_stack in self.mcp_sessions.values():
+        for old_session in self.mcp_sessions.values():
             try:
-                await exit_stack.aclose()
+                await old_session.close()
             except Exception:
-                pass
+                logger.exception(
+                    f"Failed to disconnect old MCP session of {old_session.name}"
+                )
+                raise
 
     async def flush_method_queue(self):
         for method_name, queue in self.thread_queues.items():
